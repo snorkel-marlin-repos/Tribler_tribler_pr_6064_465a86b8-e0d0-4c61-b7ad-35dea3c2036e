@@ -1,0 +1,206 @@
+import uuid
+from binascii import unhexlify
+from collections import defaultdict
+from dataclasses import dataclass
+from random import sample
+
+from ipv8.peerdiscovery.network import Network
+from ipv8.types import Peer
+
+from pony.orm import db_session
+
+from tribler_common.simpledefs import CHANNELS_VIEW_UUID, NTFY
+
+from tribler_core.modules.metadata_store.community.discovery_booster import DiscoveryBooster
+from tribler_core.modules.metadata_store.community.remote_query_community import (
+    RemoteQueryCommunity,
+    RemoteQueryCommunitySettings,
+)
+from tribler_core.modules.metadata_store.serialization import CHANNEL_TORRENT
+from tribler_core.modules.metadata_store.store import ObjState
+
+minimal_blob_size = 200
+maximum_payload_size = 1024
+max_entries = maximum_payload_size // minimal_blob_size
+max_search_peers = 5
+
+
+MAGIC_GIGACHAN_VERSION_MARK = b'\x01'
+
+
+@dataclass
+class ChannelEntry:
+    timestamp: float
+    channel_version: int
+
+
+class ChannelsPeersMapping:
+    def __init__(self, max_peers_per_channel=10):
+        self.max_peers_per_channel = max_peers_per_channel
+        self._channels_dict = defaultdict(set)
+        # Reverse mapping from peers to channels
+        self._peers_channels = defaultdict(set)
+
+    def add(self, peer: Peer, channel_pk: bytes, channel_id: int):
+        id_tuple = (channel_pk, channel_id)
+        channel_peers = self._channels_dict[id_tuple]
+
+        channel_peers.add(peer)
+        self._peers_channels[peer].add(id_tuple)
+
+        if len(channel_peers) > self.max_peers_per_channel:
+            removed_peer = min(channel_peers, key=lambda x: x.last_response)
+            channel_peers.remove(removed_peer)
+            # Maintain the reverse mapping
+            self._peers_channels[removed_peer].remove(id_tuple)
+            if not self._peers_channels[removed_peer]:
+                self._peers_channels.pop(removed_peer)
+
+    def remove_peer(self, peer):
+        for id_tuple in self._peers_channels[peer]:
+            self._channels_dict.pop(id_tuple, None)
+        self._peers_channels.pop(peer)
+
+    def get_last_seen_peers_for_channel(self, channel_pk: bytes, channel_id: int, limit=None):
+        id_tuple = (channel_pk, channel_id)
+        channel_peers = self._channels_dict.get(id_tuple, [])
+        return sorted(channel_peers, key=lambda x: x.last_response, reverse=True)[0:limit]
+
+
+@dataclass
+class GigaChannelCommunitySettings(RemoteQueryCommunitySettings):
+    queried_peers_limit: int = 1000
+    # The maximum number of peers that we got from channels to peers mapping,
+    # that must be queried in addition to randomly queried peers
+    max_mapped_query_peers = 3
+
+
+class GigaChannelCommunity(RemoteQueryCommunity):
+    community_id = unhexlify('dc43e3465cbd83948f30d3d3e8336d71cce33aa7')
+
+    def create_introduction_response(self, *args, introduction=None, extra_bytes=b'', prefix=None, new_style=False):
+        # ACHTUNG! We add extra_bytes here to identify the newer, 7.6+ version RemoteQuery/GigaChannel community
+        # dialect, so that other 7.6+ are able to distinguish between the older and newer versions.
+        return super().create_introduction_response(
+            *args,
+            introduction=introduction,
+            extra_bytes=MAGIC_GIGACHAN_VERSION_MARK,
+            prefix=prefix,
+            new_style=new_style
+        )
+
+    def __init__(self, my_peer, endpoint, network, metadata_store, **kwargs):
+        kwargs["settings"] = kwargs.get("settings", GigaChannelCommunitySettings())
+        self.notifier = kwargs.pop("notifier", None)
+
+        # ACHTUNG! We create a separate instance of Network for this community because it
+        # walks aggressively and wants lots of peers, which can interfere with other communities
+        super().__init__(my_peer, endpoint, Network(), metadata_store, **kwargs)
+
+        # This set contains all the peers that we queried for subscribed channels over time.
+        # It is emptied regularly. The purpose of this set is to work as a filter so we never query the same
+        # peer twice. If we do, this should happen really rarely
+        self.queried_peers = set()
+
+        self.discovery_booster = DiscoveryBooster(timeout_in_sec=60)
+        self.discovery_booster.apply(self)
+
+        self.channels_peers = ChannelsPeersMapping()
+
+    def get_random_peers(self, sample_size=None):
+        # Randomly sample sample_size peers from the complete list of our peers
+        all_peers = self.get_peers()
+        if sample_size is not None and sample_size < len(all_peers):
+            return sample(all_peers, sample_size)
+        return all_peers
+
+    def introduction_response_callback(self, peer, dist, payload):
+        # ACHTUNG! Due to Dispersy legacy, it is possible for other peer to send us an introduction
+        # to ourselves (peer's public_key is not sent along with the introduction). To prevent querying
+        # ourselves, we add the check for blacklist_mids here, which by default contains our own peer.
+        if (
+            peer.address in self.network.blacklist
+            or peer.mid in self.queried_peers
+            or peer.mid in self.network.blacklist_mids
+        ):
+            return
+        if len(self.queried_peers) >= self.settings.queried_peers_limit:
+            self.queried_peers.clear()
+        self.queried_peers.add(peer.mid)
+        self.send_remote_select_subscribed_channels(peer)
+
+    def send_remote_select_subscribed_channels(self, peer):
+        def on_packet_callback(_, processing_results):
+            # We use responses for requests about subscribed channels to bump our local channels ratings
+            with db_session:
+                for c in (r.md_obj for r in processing_results if r.md_obj.metadata_type == CHANNEL_TORRENT):
+                    self.mds.vote_bump(c.public_key, c.id_, peer.public_key.key_to_bin()[10:])
+                    self.channels_peers.add(peer, c.public_key, c.id_)
+
+            # Notify GUI about the new channels
+            results = [
+                r.md_obj.to_simple_dict()
+                for r in processing_results
+                if (
+                    r.obj_state == ObjState.UNKNOWN_OBJECT
+                    and r.md_obj.metadata_type == CHANNEL_TORRENT
+                    and r.md_obj.origin_id == 0
+                )
+            ]
+            if self.notifier and results:
+                self.notifier.notify(NTFY.CHANNEL_DISCOVERED, {"results": results, "uuid": str(CHANNELS_VIEW_UUID)})
+
+        request_dict = {
+            "metadata_type": [CHANNEL_TORRENT],
+            "subscribed": True,
+            "attribute_ranges": (("num_entries", 1, None),),
+            "complete_channel": True,
+        }
+        self.send_remote_select(peer, **request_dict, processing_callback=on_packet_callback)
+
+    def send_search_request(self, **kwargs):
+        # Send a remote query request to multiple random peers to search for some terms
+        request_uuid = uuid.uuid4()
+
+        def notify_gui(_, processing_results):
+            results = [
+                r.md_obj.to_simple_dict()
+                for r in processing_results
+                if r.obj_state in (ObjState.UNKNOWN_OBJECT, ObjState.UPDATED_OUR_VERSION)
+            ]
+            if self.notifier and results:
+                self.notifier.notify(NTFY.REMOTE_QUERY_RESULTS, {"results": results, "uuid": str(request_uuid)})
+
+        # Try sending the request to at least some peers that we know have it
+        if "channel_pk" in kwargs and "origin_id" in kwargs:
+            peers_to_query = self.get_known_subscribed_peers_for_node(
+                unhexlify(kwargs["channel_pk"]), kwargs["origin_id"], self.settings.max_mapped_query_peers
+            )
+        else:
+            peers_to_query = self.get_random_peers(self.settings.max_query_peers)
+
+        for p in peers_to_query:
+            self.send_remote_select(p, **kwargs, processing_callback=notify_gui)
+
+        return request_uuid
+
+    def get_known_subscribed_peers_for_node(self, node_pk, node_id, limit=None):
+        # Determine the toplevel parent channel
+        with db_session:
+            node = self.mds.ChannelNode.get(public_key=node_pk, id_=node_id)
+            root_id = next((value for value in node.get_parents_ids() if value != 0), node_id) if node else node_id
+
+        return self.channels_peers.get_last_seen_peers_for_channel(node_pk, root_id, limit)
+
+    def _on_query_timeout(self, request_cache):
+        if not request_cache.peer_responded:
+            self.channels_peers.remove_peer(request_cache.peer)
+        super()._on_query_timeout(request_cache)
+
+
+class GigaChannelTestnetCommunity(GigaChannelCommunity):
+    """
+    This community defines a testnet for the giga channels, used for testing purposes.
+    """
+
+    community_id = unhexlify('ad8cece0dfdb0e03344b59a4d31a38fe9812da9d')
